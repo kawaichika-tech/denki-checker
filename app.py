@@ -677,6 +677,26 @@ def parse_json_response(text):
             except json.JSONDecodeError:
                 pass
 
+    # 修復試行: 途中で切れたJSONを最後の完全な項目までで閉じる
+    for target in [cleaned, text]:
+        start = target.find('{')
+        if start == -1:
+            continue
+        candidate = target[start:]
+        items_pos = candidate.find('"items"')
+        if items_pos == -1:
+            continue
+        last_complete = candidate.rfind('},', items_pos)
+        if last_complete == -1:
+            last_complete = candidate.rfind('}', items_pos)
+            if last_complete == -1:
+                continue
+        for closing in ('\n  ]\n}', ']}', '}\n  ]\n}'):
+            try:
+                return json.loads(candidate[:last_complete + 1] + closing)
+            except json.JSONDecodeError:
+                continue
+
     return None
 
 
@@ -825,7 +845,7 @@ def check():
 
         message = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=16384,
+            max_tokens=32000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": content}],
         )

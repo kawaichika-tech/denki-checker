@@ -750,6 +750,25 @@ def parse_json_response(text):
                 return json.loads(target[start:end + 1])
             except json.JSONDecodeError:
                 pass
+    # Repair attempt: response truncated mid-JSON. Close at last complete item.
+    for target in [cleaned, text]:
+        start = target.find('{')
+        if start == -1:
+            continue
+        candidate = target[start:]
+        items_pos = candidate.find('"items"')
+        if items_pos == -1:
+            continue
+        last_complete = candidate.rfind('},', items_pos)
+        if last_complete == -1:
+            last_complete = candidate.rfind('}', items_pos)
+            if last_complete == -1:
+                continue
+        for closing in ('\n  ]\n}', ']}', '}\n  ]\n}'):
+            try:
+                return json.loads(candidate[:last_complete + 1] + closing)
+            except json.JSONDecodeError:
+                continue
     return None
 
 
@@ -807,15 +826,17 @@ def run_check(drawing_bytes, drawing_name, table_bytes, table_name, selected_fea
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=16384,
+            max_tokens=32000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": content}],
         )
         raw = message.content[0].text
         parsed = parse_json_response(raw)
         if parsed is None:
+            st.session_state['debug_raw_response'] = raw
             st.error(f"解析失敗（全長:{len(raw)}文字）。Claude APIのレスポンスが不正です。")
             return None
+        st.session_state.pop('debug_raw_response', None)
         return parsed
     except anthropic.AuthenticationError:
         st.error("APIキーが無効です。正しいAPIキーを設定してください。")
@@ -1000,6 +1021,13 @@ def main():
                 else:
                     st.session_state.pop('drawing_pdf_bytes', None)
                 st.rerun()
+
+    # Show raw response on parse failure for debugging
+    if st.session_state.get('debug_raw_response'):
+        with st.expander("🔍 デバッグ: Claude API レスポンス（解析失敗時の生データ）"):
+            raw = st.session_state['debug_raw_response']
+            st.caption(f"全長: {len(raw)} 文字")
+            st.text(raw[:500] + ('\n\n...（中略）...\n\n' + raw[-500:] if len(raw) > 1000 else ''))
 
     # ── Results ───────────────────────────────────────────────────────────
     if st.session_state.get('result'):
