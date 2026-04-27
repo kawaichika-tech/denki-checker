@@ -857,7 +857,7 @@ def check():
 
         with client.messages.stream(
             model="claude-sonnet-4-6",
-            max_tokens=32000,
+            max_tokens=48000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": content}],
         ) as stream:

@@ -844,7 +844,7 @@ def run_check(drawing_bytes, drawing_name, table_bytes, table_name, selected_fea
         client = anthropic.Anthropic(api_key=api_key)
         with client.messages.stream(
             model="claude-sonnet-4-6",
-            max_tokens=32000,
+            max_tokens=48000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": content}],
         ) as stream:
@@ -885,18 +885,14 @@ def get_pdf_page_sizes(pdf_bytes):
 
 
 def make_annotation_for_item(item, page_sizes):
-    """Convert item's normalized bbox to streamlit-pdf-viewer annotation. Returns (annotations_list, page_num) or (None, None)."""
-    page = item.get('page')
+    """Convert item's normalized bbox to streamlit-pdf-viewer annotation. Returns (annotations_list, page_num)."""
+    page = item.get('page') or 1
     bbox = item.get('bbox')
-    if not page:
-        return None, None
     try:
         page_num = int(page)
     except (TypeError, ValueError):
-        return None, None
-    page_idx = page_num - 1
-    if page_idx < 0:
-        return None, None
+        page_num = 1
+    page_idx = max(0, page_num - 1)
     pw, ph = page_sizes[page_idx] if page_idx < len(page_sizes) else (595, 842)
     if not bbox or not isinstance(bbox, dict):
         return [], page_num
@@ -917,18 +913,20 @@ def make_annotation_for_item(item, page_sizes):
     }], page_num
 
 
-def render_pdf_preview(pdf_bytes, height=780, annotations=None, scroll_to_page=None):
+def render_pdf_preview(pdf_bytes, height=780, annotations=None, scroll_to_page=None, view_key=""):
     if HAS_PDF_VIEWER:
-        kwargs = {"width": "100%", "height": height, "key": "pdf_main"}
+        # Use selection-dependent key so component re-renders when annotations change
+        kwargs = {"width": "100%", "height": height, "key": f"pdf_main_{view_key}"}
         if annotations:
             kwargs["annotations"] = annotations
-            kwargs["annotation_outline_size"] = 3
+            kwargs["annotation_outline_size"] = 5
         if scroll_to_page:
             kwargs["scroll_to_page"] = scroll_to_page
         pdf_viewer(pdf_bytes, **kwargs)
     else:
         base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-        pdf_html = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="{height}" style="border:1px solid #e2e8f0; border-radius:8px;"></iframe>'
+        page_frag = f"#page={scroll_to_page}" if scroll_to_page else ""
+        pdf_html = f'<iframe src="data:application/pdf;base64,{base64_pdf}{page_frag}" width="100%" height="{height}" style="border:1px solid #e2e8f0; border-radius:8px;"></iframe>'
         components.html(pdf_html, height=height + 10, scrolling=False)
 
 
@@ -970,15 +968,16 @@ def render_card(item, can_view=False, key_prefix=''):
         <span style="background:{cfg['color']};color:white;font-size:11px;font-weight:bold;
             padding:2px 8px;border-radius:9999px;white-space:nowrap;">{cfg['label']}</span>
     </div>"""
-    has_loc = can_view and item.get('page') is not None
-    if has_loc:
+    if can_view:
         cols = st.columns([14, 1])
         with cols[0]:
             st.markdown(html, unsafe_allow_html=True)
         with cols[1]:
-            page_num = item.get('page')
+            page_num = item.get('page') or 1
+            has_bbox = isinstance(item.get('bbox'), dict)
             btn_label = "📍" if not selected else "✅"
-            if st.button(btn_label, key=f"{key_prefix}view_{id_}", help=f"図面 p.{page_num} で確認"):
+            tip = f"図面 p.{page_num}{'（位置矩形あり）' if has_bbox else 'を表示'}"
+            if st.button(btn_label, key=f"{key_prefix}view_{id_}", help=tip):
                 st.session_state['selected_item_id'] = id_
                 st.rerun()
     else:
@@ -1148,9 +1147,25 @@ def main():
                     if selected_id and st.button("解除", key="clear_selection", help="ハイライト解除"):
                         st.session_state.pop('selected_item_id', None)
                         st.rerun()
-                render_pdf_preview(pdf_bytes, annotations=annotations, scroll_to_page=scroll_to_page)
+                render_pdf_preview(pdf_bytes, annotations=annotations, scroll_to_page=scroll_to_page, view_key=str(selected_id or 'none'))
             with col_results:
                 render_results(st.session_state['result'], can_view=True)
+
+            # Diagnostic: show how many items have page/bbox
+            all_items = st.session_state['result'].get('items', [])
+            with_page = sum(1 for i in all_items if i.get('page'))
+            with_bbox = sum(1 for i in all_items if isinstance(i.get('bbox'), dict))
+            with st.expander(f"🔧 位置情報の取得状況: {with_page}/{len(all_items)}項目に page、{with_bbox}項目に bbox"):
+                st.caption("Claude が page/bbox を返した項目（先頭20件）:")
+                shown = 0
+                for it in all_items:
+                    if it.get('page') or isinstance(it.get('bbox'), dict):
+                        st.write(f"- **{it.get('id')}**: {it.get('title','')} → page={it.get('page')}, bbox={it.get('bbox')}")
+                        shown += 1
+                        if shown >= 20:
+                            break
+                if shown == 0:
+                    st.warning("Claude から page/bbox の情報が返されていません。プロンプトの調整が必要かもしれません。")
         else:
             render_results(st.session_state['result'], can_view=False)
         if st.button("🔄 リセット"):
