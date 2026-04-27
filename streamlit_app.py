@@ -14,6 +14,12 @@ try:
 except ImportError:
     HAS_PDF_VIEWER = False
 
+try:
+    from pypdf import PdfReader
+    HAS_PYPDF = True
+except ImportError:
+    HAS_PYPDF = False
+
 
 # ─── API Key ───────────────────────────────────────────────────────────────────
 def get_api_key():
@@ -608,7 +614,9 @@ SYSTEM_PROMPT = """あなたは住宅建築の電気図面チェッカーです�
       "title": "エアコン近くのDL干渉確認",
       "status": "OK",
       "detail": "エアコンとDLの注釈確認",
-      "evidence": "「※エアコン付近DL影注意」 図面右下注記付近"
+      "evidence": "「※エアコン付近DL影注意」 図面右下注記付近",
+      "page": 1,
+      "bbox": {"x": 0.7, "y": 0.85, "width": 0.2, "height": 0.05}
     }
   ]
 }
@@ -625,7 +633,17 @@ evidenceは判定の根拠となった図面内の注釈・シンボル・テキ
 - "OK"の場合: 該当する注釈・テキスト・シンボルを引用（例:「『※エアコン付近DL影注意』 右下注記」）
 - "NG"の場合: 不足している記述や問題箇所を具体的に（例:「『シーリングファン用スイッチ』の注釈が見当たらない」）
 - "要目視"の場合: 視覚確認が必要な対象・場所（例:「平面図中央の階段付近、ブラケット高さ要確認」）
-- "対象外"の場合: 簡潔に（例:「該当設備（シーリングファン）なし」）"""
+- "対象外"の場合: 簡潔に（例:「該当設備（シーリングファン）なし」）
+
+【pageとbboxフィールド（PDF入力時のみ。DXF入力や対象外項目は省略可）】
+"page": 該当箇所が記載されているPDFのページ番号（整数、1始まり）
+"bbox": 該当箇所の矩形位置。ページ左上を(0,0)、右下を(1,1)とした正規化座標
+  - x: 矩形左上のx座標（0〜1）
+  - y: 矩形左上のy座標（0〜1、上が0）
+  - width: 矩形の幅（0〜1）
+  - height: 矩形の高さ（0〜1）
+位置は厳密でなくてよく、視覚的に「このあたり」と分かる程度で十分です。
+判定の根拠が複数箇所にまたがる場合は最も代表的な1箇所を指示してください。"""
 
 
 # ─── DXF Parser ────────────────────────────────────────────────────────────────
@@ -851,9 +869,63 @@ def run_check(drawing_bytes, drawing_name, table_bytes, table_name, selected_fea
 
 
 # ─── PDF Preview ───────────────────────────────────────────────────────────────
-def render_pdf_preview(pdf_bytes, height=780):
+@st.cache_data
+def get_pdf_page_sizes(pdf_bytes):
+    """Return list of (width, height) in PDF points for each page."""
+    if not HAS_PYPDF:
+        return [(595, 842)]
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        sizes = []
+        for page in reader.pages:
+            sizes.append((float(page.mediabox.width), float(page.mediabox.height)))
+        return sizes if sizes else [(595, 842)]
+    except Exception:
+        return [(595, 842)]
+
+
+def make_annotation_for_item(item, page_sizes):
+    """Convert item's normalized bbox to streamlit-pdf-viewer annotation. Returns (annotations_list, page_num) or (None, None)."""
+    page = item.get('page')
+    bbox = item.get('bbox')
+    if not page:
+        return None, None
+    try:
+        page_num = int(page)
+    except (TypeError, ValueError):
+        return None, None
+    page_idx = page_num - 1
+    if page_idx < 0:
+        return None, None
+    pw, ph = page_sizes[page_idx] if page_idx < len(page_sizes) else (595, 842)
+    if not bbox or not isinstance(bbox, dict):
+        return [], page_num
+    try:
+        x = max(0.0, min(1.0, float(bbox.get('x', 0))))
+        y = max(0.0, min(1.0, float(bbox.get('y', 0))))
+        w = max(0.01, min(1.0, float(bbox.get('width', 0.05))))
+        h = max(0.01, min(1.0, float(bbox.get('height', 0.05))))
+    except (TypeError, ValueError):
+        return [], page_num
+    return [{
+        "page": page_num,
+        "x": int(x * pw),
+        "y": int(y * ph),
+        "width": int(w * pw),
+        "height": int(h * ph),
+        "color": "red",
+    }], page_num
+
+
+def render_pdf_preview(pdf_bytes, height=780, annotations=None, scroll_to_page=None):
     if HAS_PDF_VIEWER:
-        pdf_viewer(pdf_bytes, height=height, width="100%")
+        kwargs = {"width": "100%", "height": height, "key": "pdf_main"}
+        if annotations:
+            kwargs["annotations"] = annotations
+            kwargs["annotation_outline_size"] = 3
+        if scroll_to_page:
+            kwargs["scroll_to_page"] = scroll_to_page
+        pdf_viewer(pdf_bytes, **kwargs)
     else:
         base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
         pdf_html = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="{height}" style="border:1px solid #e2e8f0; border-radius:8px;"></iframe>'
@@ -868,7 +940,7 @@ STATUS_CFG = {
     '対象外': {'color': '#94a3b8', 'bg': '#f8fafc', 'border': '#e2e8f0', 'label': '対象外'},
 }
 
-def render_card(item):
+def render_card(item, can_view=False, key_prefix=''):
     cfg = STATUS_CFG.get(item.get('status', '対象外'), STATUS_CFG['対象外'])
     id_ = str(item.get('id', ''))
     title = str(item.get('title', ''))
@@ -882,10 +954,12 @@ def render_card(item):
             f'border-left:2px solid #cbd5e1;line-height:1.5;">'
             f'📌 <span style="color:#475569;">{evidence}</span></div>'
         )
+    selected = (st.session_state.get('selected_item_id') == id_)
+    border_extra = '; box-shadow:0 0 0 2px #2563eb' if selected else ''
     html = f"""<div style="border-left:4px solid {cfg['color']};background:{cfg['bg']};
         border:1px solid {cfg['border']};border-left:4px solid {cfg['color']};
         border-radius:8px;padding:10px 14px;margin-bottom:6px;
-        display:flex;align-items:flex-start;gap:10px;">
+        display:flex;align-items:flex-start;gap:10px{border_extra};">
         <span style="font-family:monospace;font-size:11px;color:#94a3b8;
             min-width:2rem;padding-top:2px;">{id_}</span>
         <div style="flex:1;">
@@ -896,10 +970,22 @@ def render_card(item):
         <span style="background:{cfg['color']};color:white;font-size:11px;font-weight:bold;
             padding:2px 8px;border-radius:9999px;white-space:nowrap;">{cfg['label']}</span>
     </div>"""
-    st.markdown(html, unsafe_allow_html=True)
+    has_loc = can_view and item.get('page') is not None
+    if has_loc:
+        cols = st.columns([14, 1])
+        with cols[0]:
+            st.markdown(html, unsafe_allow_html=True)
+        with cols[1]:
+            page_num = item.get('page')
+            btn_label = "📍" if not selected else "✅"
+            if st.button(btn_label, key=f"{key_prefix}view_{id_}", help=f"図面 p.{page_num} で確認"):
+                st.session_state['selected_item_id'] = id_
+                st.rerun()
+    else:
+        st.markdown(html, unsafe_allow_html=True)
 
 
-def render_results(data):
+def render_results(data, can_view=False):
     property_name = data.get('property', '不明')
     items = data.get('items', [])
 
@@ -915,12 +1001,15 @@ def render_results(data):
     c3.metric("🟢 OK", counts['OK'])
     c4.metric("⚪ 対象外", counts['対象外'])
 
+    if can_view:
+        st.caption("📍ボタンで該当箇所を図面プレビューに表示します（位置はおおよそ）")
+
     # NG items first
     ng_items = [i for i in items if i.get('status') == 'NG']
     if ng_items:
         st.markdown(f"### 🔴 NG項目（{len(ng_items)}件）— 要対応")
         for item in ng_items:
-            render_card(item)
+            render_card(item, can_view=can_view, key_prefix='ng_')
         st.markdown("---")
 
     # All items by category
@@ -938,7 +1027,7 @@ def render_results(data):
         label = f"**{cat}**（{len(cat_items)}件" + (f"　🔴NG:{ng_c}" if ng_c else "") + "）"
         with st.expander(label, expanded=(ng_c > 0)):
             for item in sorted(cat_items, key=lambda x: int(x.get('id', 0)) if str(x.get('id', '')).isdigit() else 999):
-                render_card(item)
+                render_card(item, can_view=can_view, key_prefix='cat_')
 
     # Copy text button
     st.markdown("---")
@@ -1035,17 +1124,39 @@ def main():
         st.markdown("---")
         pdf_bytes = st.session_state.get('drawing_pdf_bytes')
         if pdf_bytes:
+            page_sizes = get_pdf_page_sizes(pdf_bytes)
+            selected_id = st.session_state.get('selected_item_id')
+            annotations = None
+            scroll_to_page = None
+            selected_title = None
+            if selected_id:
+                for it in st.session_state['result'].get('items', []):
+                    if str(it.get('id')) == selected_id:
+                        annotations, scroll_to_page = make_annotation_for_item(it, page_sizes)
+                        selected_title = it.get('title', '')
+                        break
+
             col_pdf, col_results = st.columns([1, 1], gap="medium")
             with col_pdf:
-                st.markdown("**📐 図面プレビュー**")
-                render_pdf_preview(pdf_bytes)
+                hdr_cols = st.columns([4, 1])
+                with hdr_cols[0]:
+                    if scroll_to_page:
+                        st.markdown(f"**📐 図面プレビュー** &nbsp; <span style='color:#2563eb;font-size:12px;'>📍 項目{selected_id}（p.{scroll_to_page}）{selected_title or ''}</span>", unsafe_allow_html=True)
+                    else:
+                        st.markdown("**📐 図面プレビュー** &nbsp; <span style='color:#94a3b8;font-size:12px;'>項目の📍ボタンで該当箇所を表示</span>", unsafe_allow_html=True)
+                with hdr_cols[1]:
+                    if selected_id and st.button("解除", key="clear_selection", help="ハイライト解除"):
+                        st.session_state.pop('selected_item_id', None)
+                        st.rerun()
+                render_pdf_preview(pdf_bytes, annotations=annotations, scroll_to_page=scroll_to_page)
             with col_results:
-                render_results(st.session_state['result'])
+                render_results(st.session_state['result'], can_view=True)
         else:
-            render_results(st.session_state['result'])
+            render_results(st.session_state['result'], can_view=False)
         if st.button("🔄 リセット"):
             st.session_state.pop('result', None)
             st.session_state.pop('drawing_pdf_bytes', None)
+            st.session_state.pop('selected_item_id', None)
             st.rerun()
 
     st.markdown("---")
