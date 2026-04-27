@@ -843,14 +843,15 @@ def check():
                 },
             ]
 
-        message = client.messages.create(
+        with client.messages.stream(
             model="claude-sonnet-4-6",
             max_tokens=32000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": content}],
-        )
+        ) as stream:
+            final_message = stream.get_final_message()
 
-        raw = message.content[0].text
+        raw = final_message.content[0].text
         parsed = parse_json_response(raw)
 
         if parsed is None:

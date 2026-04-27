@@ -824,13 +824,14 @@ def run_check(drawing_bytes, drawing_name, table_bytes, table_name, selected_fea
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
-        message = client.messages.create(
+        with client.messages.stream(
             model="claude-sonnet-4-6",
             max_tokens=32000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": content}],
-        )
-        raw = message.content[0].text
+        ) as stream:
+            final_message = stream.get_final_message()
+        raw = final_message.content[0].text
         parsed = parse_json_response(raw)
         if parsed is None:
             st.session_state['debug_raw_response'] = raw
